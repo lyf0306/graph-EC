@@ -460,7 +460,7 @@ async def main():
                 {"role": "user", "content": user_prompt}
             ],
             stream=True,
-            temperature=0.3,
+            temperature=0.2,
             max_tokens=2048
         )
 
