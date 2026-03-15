@@ -608,9 +608,7 @@ async def kg_query(
     global_config: dict,
     hashing_kv: BaseKVStorage = None,
 ) -> str:
-    
-    hl_keywords = query
-    ll_keywords = query
+    hl_keywords, ll_keywords = query, query
     keywords = [ll_keywords, hl_keywords]
     context = await _build_query_context(
         keywords,
@@ -619,8 +617,8 @@ async def kg_query(
         hyperedges_vdb,
         text_chunks_db,
         query_param,
+        global_config  # <--- [修改点] 把配置往下传
     )
-    
     return context
 
 
@@ -632,76 +630,38 @@ async def _build_query_context(
     hyperedges_vdb: BaseVectorStorage,
     text_chunks_db: BaseKVStorage[TextChunkSchema],
     query_param: QueryParam,
+    global_config: dict, # <--- 接收配置
 ):
     ll_kewwords, hl_keywrds = query[0], query[1]
 
-    # 1. 第一路：知识图谱（逻辑推演召回，黄金标准）
+    # 【流 A】图谱流：拓扑计分 (内部已排序) -> 获得 Rank A
     knowledge_list_1 = await _get_node_data(
-        ll_kewwords,
-        knowledge_graph_inst,
-        entities_vdb,
-        text_chunks_db,
-        query_param,
+        ll_kewwords, knowledge_graph_inst, entities_vdb, text_chunks_db, query_param
     )
 
-    # 2. 第二路：向量数据库（字面语义召回，作为补充）
-    # (如果你的 Reranker 是在这一路生效的，它的结果已经在这个 list 里排好序了)
+    # 【流 B】向量流：传入查询词和配置，内部触发 Rerank 洗牌 -> 获得 Rank B
     knowledge_list_2 = await _get_edge_data(
-        hl_keywrds,
-        knowledge_graph_inst,
-        hyperedges_vdb,
-        text_chunks_db,
-        query_param,
+        hl_keywrds, knowledge_graph_inst, hyperedges_vdb, text_chunks_db, query_param, global_config
     )
     
-    # 🌟 核心学术创新：加权倒数排序融合 (W-RRF - Weighted Reciprocal Rank Fusion)
+    # 【终极组装】W-RRF 双路融合
     know_score = dict()
-    
-    # RRF 平滑常数 K (信息检索领域标准推荐值为 60，防止 Rank 1 权重畸高失真)
     K = 60.0 
-    
-    # ⚠️ 特权权重：因为图谱的结果经过了严格的临床排他与赋权，我们赋予它绝对主导权！
-    ALPHA = 2.0  # 图谱逻辑的权重乘数 (可调节)
-    BETA = 1.5   # 向量语义的权重乘数
-    
-    # 计算图谱路 RRF 得分
+    ALPHA = 1.5  # 图谱特权权重 (保护临床绝对禁忌和强关联)
+    BETA = 1.0   # 向量语义权重
+
     for i, k in enumerate(knowledge_list_1):
-        if k not in know_score:
-            know_score[k] = 0.0
-        # 公式: Alpha * (1 / (K + Rank))
+        if k not in know_score: know_score[k] = 0.0
         know_score[k] += ALPHA * (1.0 / (K + i + 1))
         
-    # 计算向量路 RRF 得分
     for i, k in enumerate(knowledge_list_2):
-        if k not in know_score:
-            know_score[k] = 0.0
-        # 公式: Beta * (1 / (K + Rank))
+        if k not in know_score: know_score[k] = 0.0
         know_score[k] += BETA * (1.0 / (K + i + 1))
         
-    # 按照最终的混合 RRF 得分降序排列，并截断至 top_k
     knowledge_list = sorted(know_score.items(), key=lambda x: x[1], reverse=True)[:query_param.top_k]
     
-    # ==== 🖨️ 控制台打印融合战报 (让你亲眼看着图谱如何碾压 Reranker) ====
-    print("\n" + "="*15 + " ⚖️ [W-RRF 双路加权融合战报] " + "="*15)
-    for idx, (content, score) in enumerate(knowledge_list):
-        snippet = content[:30].replace('\n', ' ') + "..."
-        source = []
-        if content in knowledge_list_1:
-            source.append(f"图谱(Rank {knowledge_list_1.index(content)+1})")
-        if content in knowledge_list_2:
-            source.append(f"向量(Rank {knowledge_list_2.index(content)+1})")
-            
-        print(f"Top {idx+1} | 融合得分: {score:.5f} | 来源: {' ➕ '.join(source)}")
-        print(f"  └─ 内容: {snippet}")
-    print("="*62 + "\n")
-
-    # 组装最终格式返回
-    knowledge = []
-    for k in knowledge_list:
-        knowledge.append({"<knowledge>": k[0], "<coherence>": round(k[1], 4)})
-        
+    knowledge = [{"<knowledge>": k[0], "<coherence>": round(k[1], 4)} for k in knowledge_list]
     return knowledge
-
 
 
 async def _get_node_data(
@@ -839,12 +799,12 @@ async def _find_most_related_text_unit_from_entities(
 
 # 💡 全局配置：定义临床语义角色权重乘数
 ROLE_WEIGHT_MULTIPLIERS = {
-    "CONDITION": 1.5,          # 适应症/前提条件 -> 高奖励
-    "RECOMMENDATION": 1.2,     # 推荐动作 -> 中奖励
-    "CONTRAINDICATION": 3.0,   # 禁忌症 -> 极高权重强行召回，以便触发红色警报！
-    "EVIDENCE": 0.8,           # 循证依据 -> 略微降权
-    "CONTEXT": 0.2,            # 背景/套话 -> 极度重罚
-    "UNKNOWN": 1.0             # 默认/缺失 role 时
+    "CONDITION": 1.0,          # 适应症/前提条件 -> 基础权重
+    "RECOMMENDATION": 1.5,     # 推荐动作 -> 提供分子放大增益，鼓励核心方案
+    "CONTRAINDICATION": -999.0,# 禁忌症 -> 极负权重强行触发微观方案的一票否决
+    "EVIDENCE": 0.8,           # 证据支撑 -> 略低于核心条件
+    "CONTEXT": 0.2,            # 背景信息 -> 补充性权重
+    "UNKNOWN": 1.0             # 未知角色 -> 默认保底
 }
 
 async def _find_most_related_edges_from_entities(
@@ -875,139 +835,190 @@ async def _find_most_related_edges_from_entities(
     unique_hyperedges = list(hyperedge_to_entities.keys())
 
     # ==========================================
-    # 阶段二：获取二阶邻居，计算超边密度与 Parent 归属
+    # 阶段二：获取二阶邻居，锁定文献归属并提取所有相关特征
     # ==========================================
     hyperedge_neighbors = await asyncio.gather(
         *[knowledge_graph_inst.get_node_edges(he) for he in unique_hyperedges]
     )
 
-    hyperedge_density = {}
     parent_aggregation = defaultdict(lambda: {"contained_hyperedges": set(), "matched_items": set()})
+    all_neighbor_entities = set() # 记录参与这些超边的所有特征节点 (包括未命中的)
     
     for he, neighbors in zip(unique_hyperedges, hyperedge_neighbors):
         if not neighbors:
-            hyperedge_density[he] = 1
             continue
-            
-        hyperedge_density[he] = len(neighbors) 
-        
         for edge in neighbors:
             neighbor_name = edge[1]
             if neighbor_name.startswith("paper::"): 
                 parent_aggregation[neighbor_name]["contained_hyperedges"].add(he)
                 parent_aggregation[neighbor_name]["matched_items"].update(hyperedge_to_entities[he])
+            elif not neighbor_name.startswith("<hyperedge>"):
+                all_neighbor_entities.add(neighbor_name)
 
     # ==========================================
-    # 阶段三：计算二阶拓扑实体基础权重 (Specificity × Density)
+    # 🌟 阶段三：基于 IDF 权重的超图信息熵计算 (微观方案层)
+    # 理论公式: S(e) = (Σ Hit_Weights) / (Σ Total_Weights)
     # ==========================================
-    entity_base_weights = {}
-    entity_degrees = {dp["entity_name"]: dp.get("rank", 1) if dp.get("rank", 1) > 0 else 1 for dp in node_datas}
+    # 1. 提取当前患者命中的特征的 IDF 权重
+    hit_entity_idf = {dp["entity_name"]: float(dp.get("idf_weight", 1.0)) for dp in node_datas}
+
+    # 2. 补全未命中特征节点的 IDF 权重 (用于严格计算分母)
+    unknown_entities = list(all_neighbor_entities - set(hit_entity_idf.keys()))
+    unknown_entities_data = await asyncio.gather(
+        *[knowledge_graph_inst.get_node(ent) for ent in unknown_entities]
+    )
     
-    for ent, d1 in entity_degrees.items():
-        specificity = 1.0 / math.log10(d1 + 10)
-        connected_hes = entity_to_hyperedges.get(ent, [])
-        if connected_hes:
-            avg_density = sum([math.log10(hyperedge_density.get(he, 1) + 2) for he in connected_hes]) / len(connected_hes)
-        else:
-            avg_density = 0.1 
-        entity_base_weights[ent] = specificity * avg_density
+    all_entity_idf = hit_entity_idf.copy()
+    for ent, data in zip(unknown_entities, unknown_entities_data):
+        all_entity_idf[ent] = float(data.get("idf_weight", 1.0)) if data else 1.0
 
-    max_w = max(entity_base_weights.values()) if entity_base_weights else 1.0
-    for k in entity_base_weights:
-        entity_base_weights[k] = round(entity_base_weights[k] / max_w, 3)
+    # 3. 逐一计算每条超边的饱和度得分 S(e)
+    hyperedge_scores = {}
+    contraindicated_hyperedges = set()
+    
+    for he, neighbors in zip(unique_hyperedges, hyperedge_neighbors):
+        hit_items = hyperedge_to_entities[he]
+        
+        # 📌 算分母：该治疗方案理论上要求的所有特征信息熵总和
+        total_weight = 0.0
+        if neighbors:
+            for edge in neighbors:
+                n_name = edge[1]
+                if n_name in all_entity_idf:
+                    total_weight += all_entity_idf[n_name]
+        total_weight = max(total_weight, 0.1) # 防除零报错
+
+        # 📌 算分子：患者实际命中的特征信息熵总和
+        hit_weight = 0.0
+        has_contraindication = False
+
+        for ent, role in hit_items:
+            # 微观绝杀：只要碰上一个禁忌症特征，该方案立即暴毙
+            if role == "CONTRAINDICATION":
+                has_contraindication = True
+                contraindicated_hyperedges.add(he)
+                break 
+            
+            # 正常方案：Role 乘数作为核心动作的分子放大器
+            role_m = ROLE_WEIGHT_MULTIPLIERS.get(role, 1.0)
+            hit_weight += all_entity_idf.get(ent, 1.0) * role_m
+
+        # 📌 计算最终微观饱和度 S(e)
+        if has_contraindication:
+            hyperedge_scores[he] = -999.0  # 绝杀该超边，确保它不进入推荐池
+        else:
+            saturation = hit_weight / total_weight
+            hyperedge_scores[he] = round(saturation, 4)
 
     # ==========================================
-    # 阶段四：融合 Role 乘数，计算 Parent 级综合得分
+    # 🌟 阶段四：文献级信息降维聚合与强制曝光 (宏观文献层)
     # ==========================================
     parent_scores = []
     for parent, data in parent_aggregation.items():
+        contained_hes = data["contained_hyperedges"]
         matched_items = list(data["matched_items"]) 
-        weighted_coverage = 0
+        
+        valid_he_scores = [hyperedge_scores[he] for he in contained_hes if hyperedge_scores[he] > 0]
+        
         contraindication_alerts = [] 
+        for he in contained_hes:
+            if hyperedge_scores[he] < 0:
+                # 提取出具体是哪个特征触发了禁忌症
+                contraindication_alerts.extend([ent for ent, role in hyperedge_to_entities[he] if role == "CONTRAINDICATION"])
 
-        for ent, role in matched_items:
-            base_w = entity_base_weights.get(ent, 0.5)
-            role_multiplier = ROLE_WEIGHT_MULTIPLIERS.get(role, 1.0)
-            final_score = base_w * role_multiplier
-            weighted_coverage += final_score
+        # 聚合逻辑：只要有有效方案，或者有禁忌症警告，就向上传递
+        if valid_he_scores or contraindication_alerts:
+            coverage_score = sum(valid_he_scores)
+            
+            if contraindication_alerts:
+                # 🚨 宏观置顶：赋予极高的特权分数 (1000分)！
+                # 强制将这篇含有警告的文献推到 W-RRF 的最前列，绝对防丢
+                coverage_score += 1000.0 
 
-            if role == "CONTRAINDICATION":
-                contraindication_alerts.append(ent)
-
-        if weighted_coverage > 0:
             parent_scores.append({
                 "parent_name": parent,
-                "coverage_score": round(weighted_coverage, 3),
-                "contained_hyperedges": list(data["contained_hyperedges"]),
+                "coverage_score": round(coverage_score, 4),
+                "contained_hyperedges": list(contained_hes),
                 "matched_items": matched_items,
                 "contraindication_alerts": list(set(contraindication_alerts)) 
             })
 
+    # 按分数降序，带警报的因为有 1000 分加成，必定排在最前面
     parent_scores = sorted(
         parent_scores,
         key=lambda x: (x["coverage_score"], len(x["contained_hyperedges"])),
         reverse=True
     )
-
     top_parents = parent_scores[:5] 
 
     # ==========================================
-    # 🌟 阶段 4.5：在控制台打印可解释的“计算推演树”
+    # 阶段五：在控制台打印可解释的“信息熵拓扑推演树”
     # ==========================================
-    print("\n" + "="*15 + " 🧮 [临床语义加权计算过程明细] " + "="*15)
+    print("\n" + "="*15 + " 🧮 [高阶超图信息熵推演过程明细] " + "="*15)
     for i, p in enumerate(top_parents):
+        # 控制台打印时扣除人为加的 1000 分，展示真实推演分
+        display_score = p['coverage_score'] - 1000.0 if p["contraindication_alerts"] else p['coverage_score']
         print(f"[{i+1}] 归属文献: {p['parent_name']}")
-        print(f"    ⭐ 文献总加权分 (所有独立实体得分相加): {p['coverage_score']}")
+        print(f"    ⭐ 文献总推演分 (∑饱和度): {display_score:.4f} {'(🚨 包含最高级禁忌警报)' if p['contraindication_alerts'] else ''}")
         
-        # 为了展示详细计算，我们重新过一遍超边
         for he in p["contained_hyperedges"]:
-            hit_items = hyperedge_to_entities[he]
-            he_score = 0
-            detail_strs = []
-            
-            for ent, role in hit_items:
-                base_w = entity_base_weights.get(ent, 0.5)
-                role_m = ROLE_WEIGHT_MULTIPLIERS.get(role, 1.0)
-                sub_score = base_w * role_m
-                he_score += sub_score
-                # 记录公式明细
-                detail_strs.append(f"{ent}(Base:{base_w:.2f} × {role}:{role_m})={sub_score:.2f}")
+            score = hyperedge_scores[he]
+            if score < 0:
+                print(f"    ├─ ❌ [触发一票否决] 动作: {he[:25].replace(chr(10), '')}...")
+                continue
                 
-            # 截取超边内容前25个字符显示，保持控制台整洁
+            hit_items = hyperedge_to_entities[he]
+            detail_strs = []
+            for ent, role in hit_items:
+                w = all_entity_idf.get(ent, 1.0)
+                rm = ROLE_WEIGHT_MULTIPLIERS.get(role, 1.0)
+                detail_strs.append(f"{ent}(IDF:{w:.2f}×{rm})")
+                
             he_snippet = he[:25].replace('\n', '') + "..." 
-            print(f"    ├─ 命中动作: {he_snippet} | 动作得分: {he_score:.2f}")
-            print(f"    │   └─ 公式: {' + '.join(detail_strs)}")
-    print("="*60 + "\n")
+            print(f"    ├─ 动作饱和度: {score:.2%} | {he_snippet}")
+            print(f"    │   └─ 命中特征: {' + '.join(detail_strs)}")
+    print("="*62 + "\n")
 
     # ==========================================
-    # 阶段五：组装高度结构化且带防守预警的上下文
+    # 🌟 阶段六：组装高度结构化且带防守预警的上下文送给 W-RRF
     # ==========================================
     all_edges_data = []
 
     for p in top_parents:
-        aggregated_desc = f"【权威循证溯源：{p['parent_name']}】(匹配度得分: {p['coverage_score']})\n"
+        # 还原真实的推演分数（给大模型看的文本里，要去掉那人为加的 1000 分）
+        real_score = p['coverage_score'] - 1000.0 if p["contraindication_alerts"] else p['coverage_score']
+        aggregated_desc = f"【权威循证溯源：{p['parent_name']}】(推演饱和度: {real_score:.4f})\n"
         
+        # 🚨 显式喂给大模型“反向”负样本与强指令
         if p["contraindication_alerts"]:
             alerts_str = ", ".join(p["contraindication_alerts"])
-            aggregated_desc += f"  [⚠️ 临床绝对警报]：该患者具有特征 {alerts_str}，命中了本方案的【禁忌症(CONTRAINDICATION)】，请谨慎评估或否决本指南的常规方案！\n"
+            aggregated_desc += f"  [⚠️ 临床绝对警报]：该患者具有合并症/特征 {alerts_str}，触发了本指南的【绝对禁忌症】！\n"
+            aggregated_desc += f"  🛑 请在最终的治疗方案输出中，明确向医生指出【不可使用以下方案及原因】：\n"
+            
+            # 把被一票否决的方案原文也拼接进去，让大模型知道具体是啥不能用
+            for he in p["contained_hyperedges"]:
+                if hyperedge_scores[he] < 0:
+                    aggregated_desc += f"      ❌ 禁用方案: {he}\n"
 
+        # 接下来拼接正常的正面推荐方案
         intra_group_edges = []
         for he in p["contained_hyperedges"]:
-            hit_items = hyperedge_to_entities[he] 
-            he_weight = sum([entity_base_weights.get(ent, 0.5) * ROLE_WEIGHT_MULTIPLIERS.get(role, 1.0) for ent, role in hit_items])
-            intra_group_edges.append((he, he_weight, hit_items))
+            if hyperedge_scores[he] > 0:
+                hit_items = hyperedge_to_entities[he] 
+                intra_group_edges.append((he, hyperedge_scores[he], hit_items))
             
         intra_group_edges.sort(key=lambda x: x[1], reverse=True)
         kept_edges = intra_group_edges[:4] 
         
-        for idx, (he, w, hit_items) in enumerate(kept_edges):
-            # 将得分公式精简版传给 LLM 增加其可信赖度
-            trigger_reason = ", ".join([f"{ent}({role},得分:{round(entity_base_weights.get(ent, 0.5)*ROLE_WEIGHT_MULTIPLIERS.get(role, 1.0), 2)})" for ent, role in hit_items])
-            aggregated_desc += f"  > 核心干预动作 {idx+1} [触发逻辑: {trigger_reason}]: {he}\n"
+        for idx, (he, sat_score, hit_items) in enumerate(kept_edges):
+            trigger_reason = ", ".join([f"{ent}(IDF:{all_entity_idf.get(ent,1.0):.2f})" for ent, role in hit_items])
+            aggregated_desc += f"  > 核心正面推荐 {idx+1} [饱和度 {sat_score:.2%}, 关键证据: {trigger_reason}]: {he}\n"
 
+        # 注意这里：传给 W-RRF (返回给上一层) 的 coverage_score 依然是带 1000 的！
+        # 这样才能保证这段精心组装的文本在 W-RRF 公式里拿到最高的 Rank A 排名！
         all_edges_data.append({
             "description": aggregated_desc,
-            "coverage_score": p["coverage_score"],
+            "coverage_score": p["coverage_score"], 
             "rank": len(p["contained_hyperedges"]),
             "matched_entities": [item[0] for item in p["matched_items"]], 
             "weight": 1.0
@@ -1016,37 +1027,35 @@ async def _find_most_related_edges_from_entities(
     return all_edges_data
 
 async def _get_edge_data(
-    keywords,
+    query_str, # <--- 现在的入参是查询字符串
     knowledge_graph_inst: BaseGraphStorage,
     hyperedges_vdb: BaseVectorStorage,
     text_chunks_db: BaseKVStorage[TextChunkSchema],
     query_param: QueryParam,
+    global_config: dict, # <--- 接收配置
 ):  
     results = hyperedges_vdb
+    if not len(results): return []
 
-    if not len(results):
-        return [] # 修复返回值
-
-    # [FIX]: 提取 hyperedge_name
     edge_keys = [r["hyperedge_name"] if isinstance(r, dict) else r for r in results]
+    edge_datas = await asyncio.gather(*[knowledge_graph_inst.get_node(k) for k in edge_keys])
+    
+    edge_datas = [{"hyperedge": k, "rank": v["weight"], **v} 
+                  for k, v in zip(edge_keys, edge_datas) if v is not None]
+    
+    # 提取纯文本备用
+    docs_to_rerank = [s["hyperedge"].replace("<hyperedge>","") for s in edge_datas]
 
-    edge_datas = await asyncio.gather(
-        *[knowledge_graph_inst.get_node(k) for k in edge_keys]
-    )
-
-    if not all([n is not None for n in edge_datas]):
-        logger.warning("Some edges are missing, maybe the storage is damaged")
-
-    # [FIX]: 使用 edge_keys 进行 zip
-    edge_datas = [
-        {"hyperedge": k, "rank": v["weight"], **v}
-        for k, v in zip(edge_keys, edge_datas)
-        if v is not None
-    ]
-    edge_datas = sorted(
-        edge_datas, key=lambda x: (x["rank"], x["weight"]), reverse=True
-    )
-    knowledge_list = [s["hyperedge"].replace("<hyperedge>","") for s in edge_datas]
+    # ===== [核心] 调用注入的 Reranker 进行 Rank B 洗牌 =====
+    reranker_func = global_config.get("reranker_func", None)
+    if reranker_func and docs_to_rerank:
+        # 由外部 test.py 提供打分逻辑，返回降序排列的 doc 列表
+        knowledge_list = await reranker_func(query_str, docs_to_rerank) 
+    else:
+        # 降级方案
+        edge_datas = sorted(edge_datas, key=lambda x: (x["rank"], x["weight"]), reverse=True)
+        knowledge_list = [s["hyperedge"].replace("<hyperedge>","") for s in edge_datas]
+        
     return knowledge_list
 
 
