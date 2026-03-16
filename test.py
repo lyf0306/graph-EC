@@ -29,6 +29,7 @@ EMBEDDING_MODEL_NAME = "QwenEmbedding"
 EMBEDDING_DIM = 2560
 
 WORKING_DIR = "/root/Graph-R1/expr/DeepSeek_QwenEmbed_Graph" 
+MOE_MODEL_PATH = "/root/Model/moe_router.pth"  # 👈 你刚训练好的 MoE 权重路径
 
 # Neo4j 数据库配置
 os.environ["NEO4J_URI"] = "neo4j://localhost:7688"
@@ -36,24 +37,23 @@ os.environ["NEO4J_USERNAME"] = "neo4j"
 os.environ["NEO4J_PASSWORD"] = "12345678"
 os.environ["NEO4J_DATABASE"] = "neo4j"
 
-# ================= 深度学习打分网络 (尺寸已对齐 128) =================
-class ClinicalScoringNetwork(nn.Module):
-    def __init__(self, embedding_dim, hidden_dim=64):
-        super(ClinicalScoringNetwork, self).__init__()
-        self.fc1 = nn.Linear(embedding_dim * 4, hidden_dim)
-        self.bn1 = nn.BatchNorm1d(hidden_dim)
-        self.fc2 = nn.Linear(hidden_dim, 128) 
-        self.dropout = nn.Dropout(0.5)
-        self.out = nn.Linear(128, 1)          
+# ================= MoE 门控路由器网络 =================
+class MoERouter(nn.Module):
+    def __init__(self, input_dim):
+        super(MoERouter, self).__init__()
+        self.fc1 = nn.Linear(input_dim, 256)
+        self.bn1 = nn.BatchNorm1d(256)
+        self.dropout = nn.Dropout(0.3)
+        self.fc2 = nn.Linear(256, 64)
+        self.fc3 = nn.Linear(64, 1)
 
-    def forward(self, anchor_emb, candidate_emb):
-        diff = torch.abs(anchor_emb - candidate_emb)
-        mult = anchor_emb * candidate_emb
-        x = torch.cat([anchor_emb, candidate_emb, diff, mult], dim=-1)
+    def forward(self, x):
         x = F.relu(self.bn1(self.fc1(x)))
         x = self.dropout(x)
         x = F.relu(self.fc2(x))
-        return self.out(x).squeeze(-1)
+        # 输出 0 到 1 之间的门控权重 g
+        g = torch.sigmoid(self.fc3(x))
+        return g
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -150,7 +150,7 @@ async def extract_bilingual_features(patient_case, client):
         print(f"[Warning] 提取双语检索词失败: {e}")
         return patient_case
 
-# ================= Qwen-Reranker 打分逻辑 (向量流拦截器) =================
+# ================= Qwen-Reranker 打分逻辑 =================
 async def compute_rerank_score(query, doc, client):
     instruction = "Given a clinical case, retrieve relevant clinical guidelines and evidence that help formulate a treatment plan."
     prompt = f"<|im_start|>system\nJudge whether the Document meets the requirements based on the Query and the Instruct provided. Note that the answer can only be \"yes\" or \"no\".<|im_end|>\n<|im_start|>user\n<Instruct>: {instruction}\n\n<Query>: {query}\n\n<Document>: {doc}<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
@@ -182,22 +182,21 @@ except Exception as e:
     exit(1)
 
 async def vector_stream_reranker(query_str, docs_list):
+    """图谱底层的粗排过滤流"""
     if not docs_list: return []
-    print(f"\n>>> [引擎底层] 向量流触发独立 Rerank，正在为 {len(docs_list)} 条语义证据重新洗牌(Rank B)...")
     scores = await asyncio.gather(*[compute_rerank_score(query_str, doc, rerank_client) for doc in docs_list])
     filtered_docs = [doc for doc, score in sorted(zip(docs_list, scores), key=lambda x: x[1], reverse=True) if score > 0.05]
-    print(f"  └─ 洗牌完成，保留 {len(filtered_docs)}/{len(docs_list)} 条高质语义证据送入知识池。")
     return filtered_docs
 
 async def main():
-    print(">>> [加载模型] 正在挂载 ClinicalScoringNetwork 医疗裁判网络...")
-    scorer_model = ClinicalScoringNetwork(embedding_dim=EMBEDDING_DIM).to(DEVICE)
+    print(">>> [加载模型] 正在挂载 MoE 门控路由器...")
+    moe_model = MoERouter(input_dim=EMBEDDING_DIM).to(DEVICE)
     try:
-        scorer_model.load_state_dict(torch.load("clinical_scorer.pth"))
-        scorer_model.eval()
-        print("✅ 裁判网络加载成功！")
+        moe_model.load_state_dict(torch.load(MOE_MODEL_PATH))
+        moe_model.eval()
+        print("✅ MoE 路由器挂载成功！")
     except Exception as e:
-        print(f"❌ 裁判网络加载失败: {e}")
+        print(f"❌ MoE 路由器挂载失败，请检查路径: {e}")
         exit(1)
 
     print(f">>> [2/5] 正在初始化 GraphR1 检索引擎...")
@@ -232,7 +231,7 @@ async def main():
     print(f"\n>>> [3/5] 输入原始病例:\n{patient_case}")
     print("\n>>> [3.5/5] 正在调用 PathoLLM 执行双语临床特征提取...")
     enhanced_query = await extract_bilingual_features(patient_case, llm_client)
-    print("\n>>> [4/5] 正在执行图谱混合检索与 神经网络 重排...")
+    print("\n>>> [4/5] 正在执行图谱混合检索与 MoE 动态融合...")
     
     extended_knowledge_pool = {} 
 
@@ -244,81 +243,74 @@ async def main():
             for item in retrieved_results:
                 if isinstance(item, dict):
                     content = item.get('<knowledge>', str(item)).strip()
-                    # 🚀 修复1：完美接住底层传上来的图谱信息熵推演分数
                     graph_score = float(item.get('<coherence>', 0.0))
                     
                     if content in ["RELATES_TO", "BELONG_TO", "EVIDENCE", ""] or len(content) < 5: 
                         continue
                         
-                    # 🚀 修复2：尊重底层的宏观聚合，废弃业务层的多余图谱多跳检索
                     if content.startswith("【权威循证溯源："):
                         if "⚠️ 临床绝对警报" in content:
-                            tag_info = "🚨 禁忌症熔断警报 (图谱绝对防守)"
+                            tag_info = "🚨 禁忌症熔断警报"
                         else:
-                            tag_info = "🧠 图谱高阶逻辑推演"
+                            tag_info = "🧠 图谱高阶逻辑"
                         extended_knowledge_pool[content] = {"type": tag_info, "graph_score": graph_score}
                     else:
                         extended_knowledge_pool[content] = {"type": "🧩 纯向量语义召回", "graph_score": graph_score}
 
             # ==========================================
-            # 🚀 深度医学逻辑融合法 (Graph Entropy + Neural Scoring)
+            # 🚀 核心阶段：MoE 门控网络自适应打分
             # ==========================================
             fragments_to_sort = []
+            
+            # 1. 指挥官只看 Anchor：瞬间计算出图谱信任权重 g
             anchor_emb_np = await embedding_func(enhanced_query)
             anchor_tensor = torch.tensor(anchor_emb_np[0], dtype=torch.float32).unsqueeze(0).to(DEVICE)
+            
+            with torch.no_grad():
+                g_weight = moe_model(anchor_tensor).item()
+            print(f"\n🧠 [MoE 门控介入] 当前患者病情复杂度测算完毕，动态图谱信任权重: g = {g_weight:.3f}")
+            
             candidate_contents = list(extended_knowledge_pool.keys())
             
             if candidate_contents:
-                candidates_emb_np = await embedding_func(candidate_contents)
-                candidates_tensor = torch.tensor(candidates_emb_np, dtype=torch.float32).to(DEVICE)
-                anchor_tensor_expanded = anchor_tensor.expand(len(candidate_contents), -1)
-                
-                # 获取神经网络的纯语义打分
-                with torch.no_grad():
-                    neural_scores = scorer_model(anchor_tensor_expanded, candidates_tensor).cpu().numpy()
+                # 2. 并发计算候选方案的纯正语义分 (调用 Reranker)
+                semantic_scores = await asyncio.gather(*[
+                    compute_rerank_score(enhanced_query, content, rerank_client) 
+                    for content in candidate_contents
+                ])
                 
                 for idx, content in enumerate(candidate_contents):
                     info = extended_knowledge_pool[content]
                     sources = await get_source_details(graph_engine, content)
                     best_tier = min([get_guideline_tier(src.get('guidelines', '')) for src in sources] + [4])
                     
-                    raw_neural_score = float(neural_scores[idx])
+                    semantic_score = semantic_scores[idx]
                     graph_score = info["graph_score"]
                     
-                    # ==========================================
-                    # 🌟 核心算法：图谱拓扑与神经网络的加权融合
-                    # ==========================================
+                    # 3. 严格执行 MoE 打分公式
+                    final_score = (g_weight * graph_score) + ((1.0 - g_weight) * semantic_score)
+                    
+                    # 4. 绝对安全兜底：如果是禁忌症，强制置顶推给 LLM 去规避
                     if "🚨" in info["type"]:
-                        # 触发禁忌症的文献，底层已经给 graph_score 加了极大分数
-                        # 直接霸体保送，绝不让神经网络的低分把它刷掉！
-                        final_score = graph_score + 1000.0  
-                    elif "🧠" in info["type"]:
-                        # 图谱逻辑推演出来的宏观方案：
-                        # 用图谱分主导，神经网络分做微调
-                        final_score = (graph_score * 0.7) + (raw_neural_score * 0.3)
-                    else:
-                        # 零散的纯向量召回片段：
-                        # 此时完全相信双塔深度神经网络打分
-                        final_score = raw_neural_score
+                        final_score += 1000.0  
                         
-                    # 加上权威指南的微小加成
+                    # 5. 权威指南微调加成
                     tier_bonus = (4 - best_tier) * 0.1 
                     final_score += tier_bonus
                     
                     fragments_to_sort.append({
                         "content": content, "info": info, "sources": sources,
-                        "best_tier": best_tier, "neural_score": raw_neural_score, 
+                        "best_tier": best_tier, "semantic_score": semantic_score, 
                         "graph_score": graph_score, "final_score": final_score
                     })
             
             # 按最终融合得分降序排列
             fragments_to_sort.sort(key=lambda x: x["final_score"], reverse=True)
             
-            # 💡 精简输出：将最终喂给大模型的文献严格限制在 Top 10
             TOP_N_FOR_LLM = 10
             selected_fragments = fragments_to_sort[:TOP_N_FOR_LLM]
 
-            print("\n" + "="*20 + f" Graph+Neural 融合重排顶级证据 (Top {len(selected_fragments)}) " + "="*20)
+            print("\n" + "="*20 + f" MoE 动态融合重排证据 (Top {len(selected_fragments)}) " + "="*20)
             bibliography, ref_counter, llm_context_list = {}, 1, []
             
             for idx, frag in enumerate(selected_fragments):
@@ -334,8 +326,8 @@ async def main():
                 tier_name = TIER_NAMES[frag['best_tier']]
                 ref_tag = f"【来源文献: {', '.join(source_indices)} | 证据级别: {tier_name}】" if source_indices else "【来源文献: 未知 | 证据级别: 缺乏指南支撑】"
                 
-                # 打印日志展示融合评分详情
-                print(f"[{idx+1}] [{frag['info']['type']}] 复合终分: {frag['final_score']:.3f} (图谱推演分:{frag['graph_score']:.3f} | MLP预测分:{frag['neural_score']:.3f} | {tier_name})")
+                # 清晰展示 MoE 评分细节
+                print(f"[{idx+1}] [{frag['info']['type']}] 复合总分: {frag['final_score']:.3f} | 图谱分: {frag['graph_score']:.3f} | 语义分: {frag['semantic_score']:.3f}")
                 print(f"内容: {frag['content'][:100]}...") 
                 print("-" * 30)
                 llm_context_list.append(f"{ref_tag} {frag['content']}")
@@ -356,7 +348,7 @@ async def main():
         "2. 输出 <answer>...</answer> 结论。\n"
         "3. 方案必须极其详尽，必须明确随访频率、检查项目及内分泌/放化疗的周期和标准。\n"
         "4. 在建议中引用证据时，请直接使用原文中提供的序号标签，例如 '根据 [1] 的指南建议...'\n"
-        "5. 【关键准则】：参考证据已根据底层信息熵打分排序，排名越靠前的方案优先级越高。"
+        "5. 【关键准则】：参考证据已根据 MoE 底层逻辑融合打分排序，排名越靠前的方案优先级越高。"
     )
     user_prompt = f"【患者信息】\n{patient_case}\n\n【参考证据】\n{context_str}\n\n请制定极其详细的术后辅助治疗方案。"
 
