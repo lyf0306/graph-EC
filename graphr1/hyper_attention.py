@@ -49,7 +49,7 @@ def init_attention_system(model_path: str, vdb_path: str, embedding_dim: int):
         tensor_matrix = torch.tensor(matrix_np)
         
         for idx, item in enumerate(vdb_data["data"]):
-            entity_name = item["entity_name"]
+            entity_name = item["entity_name"].upper()
             GLOBAL_ENTITY_CACHE[entity_name] = tensor_matrix[idx]
         print(f"  ✔ 成功加载了 {len(GLOBAL_ENTITY_CACHE)} 个实体特征的离线向量！")
     else:
