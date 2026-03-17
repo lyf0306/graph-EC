@@ -9,6 +9,7 @@ import torch.nn.functional as F
 from openai import AsyncOpenAI
 from graphr1 import GraphR1, QueryParam
 from graphr1.utils import wrap_embedding_func_with_attrs
+from graphr1.hyper_attention import init_attention_system
 
 # ================= 配置区域 =================
 
@@ -36,6 +37,12 @@ os.environ["NEO4J_URI"] = "neo4j://localhost:7688"
 os.environ["NEO4J_USERNAME"] = "neo4j"
 os.environ["NEO4J_PASSWORD"] = "12345678"
 os.environ["NEO4J_DATABASE"] = "neo4j"
+
+init_attention_system(
+    model_path="/root/Model/clinical_attention_v1.pth",
+    vdb_path="/root/Graph-R1/expr/DeepSeek_QwenEmbed_Graph/vdb_entities.json",
+    embedding_dim=2560  # 如果你的 Qwen 是 3584 维，请改成 3584
+)
 
 # ================= MoE 门控路由器网络 =================
 class MoERouter(nn.Module):
