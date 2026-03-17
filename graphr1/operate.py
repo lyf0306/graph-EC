@@ -908,7 +908,7 @@ async def _find_most_related_edges_from_entities(
                 all_neighbor_entities.add(neighbor_name)
 
     # ==========================================
-    # 🌟 阶段三：基于 QA-HGAT 的动态超图信息熵计算 (保留完整的深度学习能力)
+    # 🌟 阶段三：基于 Parameterized Dual-Encoder Attention Network 的动态超图信息熵计算 (保留完整的深度学习能力)
     # ==========================================
     hit_entity_idf = {dp["entity_name"]: float(dp.get("idf_weight", 1.0)) for dp in node_datas}
 
