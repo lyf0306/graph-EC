@@ -901,7 +901,7 @@ async def _find_most_related_edges_from_entities(
                     cand_with_sim.append((cand, sim))
                 
                 # 按与 Query 的相似度降序排列 (废弃静态字典序)
-                cand_with_sim.sort(key=lambda x: x[1], reverse=True)
+                cand_with_sim.sort(key=lambda x: (x[1], x[0][1]), reverse=True)
                 candidates = [x[0] for x in cand_with_sim[:quota]]
                 
             elif quota <= 0:
@@ -919,7 +919,7 @@ async def _find_most_related_edges_from_entities(
             hyperedge_to_entities[he_name].append((entity_name, role))
             entity_to_hyperedges[entity_name].append(he_name)
 
-    unique_hyperedges = list(hyperedge_to_entities.keys())
+    unique_hyperedges = sorted(list(hyperedge_to_entities.keys()))
 
     # ==========================================
     # 阶段二：获取二阶邻居，锁定文献归属并执行基础度截断
@@ -1041,8 +1041,8 @@ async def _find_most_related_edges_from_entities(
     # ==========================================
     parent_scores = []
     for parent, data in parent_aggregation.items():
-        contained_hes = data["contained_hyperedges"]
-        matched_items = list(data["matched_items"]) 
+        contained_hes = sorted(list(data["contained_hyperedges"]))
+        matched_items = sorted(list(data["matched_items"]), key=lambda x: x[0])
         
         valid_he_scores = [hyperedge_scores[he] for he in contained_hes if hyperedge_scores[he] > 0]
         
@@ -1136,7 +1136,12 @@ async def _find_most_related_edges_from_entities(
         for idx, (he, sat_score, hit_items) in enumerate(kept_edges):
             trigger_reason = ", ".join([f"{ent}" for ent, role in hit_items])
             he_roles = "/".join(list(hyperedge_role_profiles[he]))
-            aggregated_desc += f"  > [{he_roles}] {idx+1} [推荐度 {sat_score:.2%}, 证据: {trigger_reason}]: {he}\n"
+            aggregated_desc += (
+                f"  > 候选路径 {idx+1} [{he_roles}] (神经推演推荐度: {sat_score:.2%})\n"
+                f"    ├─ 方案内容: {he}\n"
+                f"    ├─ 触发该方案的局部特征: 【{trigger_reason}】\n"
+                f"    └─ ⚠️[系统强制检验指令]: 本方案因局部特征高匹配度被召回。作为主治医师，你在总结最终方案时，必须核对【患者完整病理与分期】是否满足此方案的【全部临床前提】。如患者当前阶段（如术后辅助期）不符合该方案（如晚期姑息）的标准触发条件，请主动将其废弃或降级为讨论项，绝不可与主路径机械叠加！\n"
+            )
 
         all_edges_data.append({
             "description": aggregated_desc,
